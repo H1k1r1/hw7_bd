@@ -1,0 +1,107 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build all services
+        run: docker compose build
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests api-service
+        run: docker compose run --rm --no-deps api-service pytest tests/unit/ -v
+      - name: Unit tests consumer-service
+        run: docker compose run --rm --no-deps consumer-service pytest tests/unit/ -v
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start dependencies
+        run: docker compose up -d postgres kafka zookeeper api-service consumer-service
+      - name: Wait for services
+        run: |
+          timeout 90 bash -c 'until curl -sf http://localhost:8080/health; do sleep 2; done'
+          timeout 90 bash -c 'until curl -sf http://localhost:8081/health; do sleep 2; done'
+      - name: Run integration tests
+        run: |
+          docker compose run --rm \
+            -e API_BASE_URL=http://api-service:8080 \
+            -e CONSUMER_BASE_URL=http://consumer-service:8081 \
+            api-service pytest tests/integration/ -v
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
+
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start full system
+        run: |
+          docker compose up -d api-service consumer-service postgres kafka zookeeper
+          sleep 45
+      - name: Wait for services
+        run: |
+          timeout 120 bash -c 'until curl -sf http://localhost:8080/health; do sleep 2; done'
+          timeout 120 bash -c 'until curl -sf http://localhost:8081/health; do sleep 2; done'
+      - name: Run E2E tests
+        run: |
+          docker compose run --rm \
+            -e API_BASE_URL=http://api-service:8080 \
+            -e CONSUMER_BASE_URL=http://consumer-service:8081 \
+            api-service pytest tests/e2e/ -v
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
+
+  load-tests:
+    name: Load Tests
+    runs-on: ubuntu-latest
+    needs: e2e-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start full system
+        run: |
+          docker compose up -d
+          sleep 60
+      - name: Wait for all services
+        run: |
+          timeout 120 bash -c 'until curl -sf http://localhost:8080/health; do sleep 2; done'
+          timeout 120 bash -c 'until curl -sf http://localhost:9090/-/ready; do sleep 2; done'
+      - name: Run k6 load test
+        run: |
+          docker run --rm --network=host \
+            -e BASE_URL=http://localhost:8080 \
+            -v ${{ github.workspace }}/load-tests:/scripts \
+            grafana/k6:latest run \
+            --summary-export=/scripts/results.json \
+            /scripts/load_test.js
+      - name: Check Prometheus metrics
+        run: bash scripts/check_metrics.sh
+      - name: Upload load test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-test-results
+          path: load-tests/results.json
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
